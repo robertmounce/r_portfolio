@@ -1,0 +1,338 @@
+---
+title: "Wheelfun_Rentals_Weather_Analysis"
+author: "Robert Mounce"
+date: "2024-11-28"
+output: pdf_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Wheel Fun Rentals Analysis
+
+## Objective of Analysis
+
+The purpose of this analysis is to explore the relationships between
+park attendance at Orange County parks, bicycle repair reports, and
+weather conditions over a defined time period. By analyzing these
+variables, the study aims to identify patterns and correlations that can
+provide insights into operational planning, resource allocation, and
+potential impacts of weather on park and equipment usage. Data Sources
+and Details
+
+1.  Weather Data • Description: Daily weather records from December 31,
+    2018, to January 30, 2022, covering Orange County. • Variables:
+    Rainfall, wind speed, and other weather conditions. • Source:
+    National Oceanic and Atmospheric Administration (NOAA). • Dataset on
+    Kaggle
+    <https://www.kaggle.com/datasets/robertmounce/oc-weather-data/data>
+
+2.  Park Attendance Data • Description: Monthly attendance records for
+    Yorba Linda Regional Park and Mile Square Park from January 2019 to
+    December 2021. • Purpose: Provides insights into how weather
+    conditions may influence visitor numbers. • Source: Orange County
+    Parks Data on Kaggle.
+    <https://www.kaggle.com/datasets/robertmounce/orange-county-parks-data/data>
+
+3.  Mechanic Log Data • Description: Detailed repair reports from 2019
+    to 2020, collected through a system integrating an API and QR codes
+    onsite. • Purpose: Tracks bicycle and equipment repair trends in
+    relation to park attendance and weather patterns. • Data Cleaning
+    and Analysis: Notebook on
+    Kaggle.<https://www.kaggle.com/code/robertmounce/wheel-fun-rentals-cleaning-and-analysis/notebook>
+
+```{r Libraries and Datasets}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(lmtest)
+library(sf)
+library(sandwich)
+library(leaflet)
+library(lubridate)
+library(car)
+
+# Load the data sets
+weather_data <- read.csv("cleaned_weather_data.csv")
+attendance_data <- read.csv("Park_data.csv")
+repairs_data <- read.csv("Repair_data.csv")
+
+# Standardized column names for consistency 
+colnames(attendance_data)[colnames(attendance_data) == "Park"] <- "Location"
+colnames(weather_data)[colnames(weather_data) == "NAME"] <- "Location"
+colnames(attendance_data)[colnames(attendance_data) == "Mon.Year"] <- "Date"
+colnames(attendance_data)[colnames(attendance_data) == "Park"] <- "Location"
+colnames(attendance_data)[colnames(attendance_data) == "Visitors.Month"] <- "Month_Attendance"
+colnames(attendance_data)[colnames(attendance_data) == "Visitors.day"] <- "Average_Visitors_Per_Day"
+
+# Drop unneeded columns
+attendance_data <- attendance_data %>%
+  select(-c(Month..num., Year, Month))
+
+# Standardize date columns
+attendance_data$Date <- as.Date(attendance_data$Date, format = "%Y-%m-%d") #Monthly recorded
+weather_data$Date <- as.Date(weather_data$Date)  # Daily recorded
+repairs_data$Down_Date <- as.Date(repairs_data$Down_Date) # Daily recorded 
+repairs_data$Fixed_Date <- as.Date(repairs_data$Fixed_Date) # Daily recorded
+```
+
+## Filter and Aggregate Weather Data
+
+1.  Create a map to see what stations we want to have for our locations.
+
+```{r Weather Stations}
+# How close are these stations to our Locations
+parks <- data.frame(
+  Name = c("Yorba Linda", "Mile Square", "Huntington Beach"),
+  Latitude = c(33.8714, 33.7190, 33.653351),
+  Longitude = c(-117.7638, -117.9383, -117.994209)
+)
+# Where are the stations are at
+weather_stations <- weather_data %>%
+  select(Location, LATITUDE, LONGITUDE) %>%
+  distinct()
+
+# Create an interactive map
+leaflet() %>%
+  addTiles() %>%
+  addCircleMarkers(
+    # Weather stations
+    data = weather_stations,
+    lat = ~LATITUDE, lng = ~LONGITUDE,
+    popup = ~Location,
+    color = "red",
+    radius = 5,
+    label = ~Location
+  ) %>%
+  # Parks
+  addCircleMarkers(
+    data = parks,
+    lat = ~Latitude, lng = ~Longitude,
+    popup = ~Name,
+    color = "blue",
+    radius = 6,
+    label = ~Name
+  ) %>%
+  addLegend(
+    position = "topright",
+    colors = c("blue", "red"),
+    labels = c("Parks", "Weather Stations"),
+    title = "Locations"
+  )
+```
+
+### Weather Data Prep
+
+Based on the analysis of the data and geographic proximity, I have
+chosen to use only two weather stations for rain data. The Huntington
+Beach 2.0 ESE station was selected for both the Waterfront and Mile
+Square Park due to its proximity to these locations. For wind speed, I
+opted to use data from nearby airports rather than weather stations.
+This decision was based on observed inconsistencies and unreliability in
+wind speed measurements at the weather stations. - Waterfront: - Rain
+Data: HUNTINGTON BEACH 2.0 ESE, CA US - Mile Square Park: - Rain Data:
+HUNTINGTON BEACH 2.0 ESE, CA US - Wind Speed: SANTA ANA JOHN WAYNE
+AIRPORT, CA US (Swan Boats) - Yorba Linda Regional Park: - Rain Data:
+ANAHEIM 7.3 E, CA US - Wind Speed: FULLERTON MUNICIPAL AIRPORT, CA US
+(Swan Boats)
+
+Wind speed data is particularly relevant for swan boat operations at
+Mile Square Park and Yorba Linda Regional Park. Swan boat rentals are
+suspended when wind speeds exceed 7 mph, as higher winds can make
+boating unsafe and hard for customers to ride. Additionally, we
+hypothesize that strong winds may contribute to boat damage.
+Specifically, late-night winds could loosen the boats from the bouy they
+are attached to, causing them to hit the pond edges and sustain holes.
+
+```{r Wind Data Selection}
+# Add AvgTemp column for average temperature
+weather_data <- weather_data %>%
+  mutate(AvgTemp = (MaxTemp + MinTemp) / 2 )
+
+# Filter relevant weather station
+filtered_weather_data <- weather_data %>%
+  filter(Location %in% c("HUNTINGTON BEACH 2.0 ESE, CA US", "ANAHEIM 7.3 E, CA US"))
+
+# Separate weather by location
+yorba_weather <- filtered_weather_data%>%
+  filter(Location == "ANAHEIM 7.3 E, CA US") %>%
+  select(Date,Rain, Precipitation)
+
+mile_weather <- filtered_weather_data%>%
+  filter(Location == "HUNTINGTON BEACH 2.0 ESE, CA US") %>% 
+  select(Date, Rain, Precipitation)
+# Combine weather data with wind speed from airport stations
+mile_weather <- merge(mile_weather, weather_data %>%
+                        filter(Location == "SANTA ANA JOHN WAYNE AIRPORT, CA US")%>% 
+                        select(Date, WindSpeed, AvgTemp), by = "Date", all.x = TRUE)
+
+
+yorba_weather <- merge(yorba_weather, weather_data %>%
+                        filter(Location == "FULLERTON MUNICIPAL AIRPORT, CA US")%>% 
+                        select(Date, WindSpeed, AvgTemp), by = "Date", all.x = TRUE)
+
+```
+
+## Repair Data Preparation
+
+-   filtering out the repair data from the locations and getting the
+    number of reports grouped by the date for analysis.
+
+```{r Clean and Repair reports}
+# Drop these columns Mechanic, Down_Date_ordinal, Category, Status, Mechanic_Notes
+repairs_data <- repairs_data%>%
+  select(-matches("Mechanic|Down_Date_ordinal|Category|Status| Mechanic_Notes|PartComment"))
+
+# Filter the repair data by the Locations
+mile_repair <- repairs_data %>%
+  filter(Location %in% c("Warner", "Edinger")) %>%
+  group_by(Down_Date) %>%
+  summarise(Reports = n())
+
+yorba_repair <- repairs_data%>%
+  filter(Location == "Yorba") %>%
+  group_by(Down_Date) %>%
+  summarise(Reports = n())
+
+waterfront_repair <- repairs_data %>%
+  filter(Location == "Waterfront")
+```
+
+Attendance Data
+
+```{r}
+# Convert the attendance data column to a Month Column
+attendance_data <- attendance_data %>%
+  mutate(Month = floor_date(Date, "month")) %>%  # Extract year and month
+  select(Month, Month_Attendance)  # Keep only the relevant columns
+```
+
+```{r}
+# Add Month Column to daily data for merging
+mile_df <- mile_repair%>%
+  mutate(Month = floor_date(Down_Date, "month"))
+
+# Prepare repair data with a month column 
+yorba_df <- yorba_repair %>% 
+  mutate(Month = floor_date(Down_Date, "month"))
+
+# Merge Attendance 
+mile_df <- mile_df %>% 
+  left_join(attendance_data, by = "Month")
+
+yorba_df <- yorba_df%>% 
+  left_join(attendance_data, by = "Month")
+# Merge weather
+yorba_df <- yorba_df %>%
+  left_join(yorba_weather, by = c("Down_Date" = "Date"))
+
+mile_df<- mile_df%>%
+  left_join(mile_weather, by = c("Down_Date" = "Date"))
+
+```
+
+```{r}
+# Month column 
+mile_df <- mile_df %>% 
+  mutate(Month = floor_date(Down_Date, "month"))
+yorba_df <- yorba_df %>% 
+  mutate(Month = floor_date(Down_Date, "month"))
+
+# Group and sumarize
+mile_df <- mile_df %>%
+  group_by(Month) %>%
+  summarise(
+    Total_Reports = sum(Reports, na.rm = TRUE),
+    Avg_WindSpeed = mean(WindSpeed, na.rm = TRUE),
+    Total_Precipitation = sum(Precipitation, na.rm = TRUE),
+    Avg_Temperature = mean(AvgTemp, na.rm = TRUE),
+    Attendance = sum(Month_Attendance, na.rm = TRUE)
+  )
+
+yorba_df <- yorba_df %>%
+  group_by(Month) %>%
+  summarise(
+    Total_Reports = sum(Reports, na.rm = TRUE),
+    Avg_WindSpeed = mean(WindSpeed, na.rm = TRUE),
+    Total_Precipitation = sum(Precipitation, na.rm = TRUE),
+    Avg_Temperature = mean(AvgTemp, na.rm = TRUE),
+    Attendance = sum(Month_Attendance, na.rm = TRUE)
+  )
+
+```
+
+# Linear Regression Analysis
+
+## Yorba Linda Linear Regression
+
+## 1. Objective To explore the relationship between repair reports at
+
+```         
+Yorba Regional Park (Total_Reports) and weather conditions
+(Avg_WindSpeed, Total_Precipitation), as well as park
+attendance(Attendance) Dependent Variable: Total_Reports Independent
+Variables:
+```
+
+-   Avg_WindSpeed: Average daily windspeed (mph)
+-   Total_Precipitation: Total daily precipitation (inches)
+-   Attendance: Monthly park attendance
+
+## 2. Key Findings
+
+### 1. Attendance
+
+-   Statistically significant (p = 0.000589)
+-   Positive relationship with Total_Reports: A higher number of park
+    vistors is strongly associated with repair reports
+
+### 2. Weather Variables
+
+-   Avg_WindSpeed and Total_Precipitation remain statistically
+    significant, suggesting they have little direct impact on
+    Total_Reports
+
+## Conclusion:
+
+Attendance is the key driver of Total_reports suggesting that
+operational planning should align with park attendance levels Weather
+conditions do not have a direct, significant impact but could contribute
+indirectly when combined with attendance
+
+```{r Yorba Linda Model Analysis}
+yorba_model <- lm(Total_Reports ~ Avg_WindSpeed + Total_Precipitation + Attendance, data = yorba_df)
+summary(yorba_model)
+```
+
+```{r Yorba Residuals}
+# Plot residuals 
+par(mfrow = c(2,2))
+# Histogram of residuals
+hist(residuals(yorba_model), main = "Histogram of Residuals" , xlab = "Residuals", breaks = 20)
+# Heteroskedastcity
+bptest(yorba_model)
+```
+
+```{r}
+yorba_df$Residuals <- residuals(yorba_model)
+outlier_data <- yorba_df %>%
+  filter(Residuals > 10 | Residuals < -10)
+print(outlier_data)
+```
+
+```{r Yorba multicollinearity}
+vif(yorba_model)
+```
+
+```{r}
+yorba_att_weather_model <- lm(Total_Reports ~ Attendance * Total_Precipitation, data = yorba_df)
+summary(yorba_att_weather_model)
+```
+
+```{r Visualize Yorba Attendance}
+# Attendance vs Total_Reports
+ggplot(yorba_df, aes(x = Attendance, y = Total_Reports)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(title = "Attendance vs Total_Reports", x = "Attendance", y = "Total Reports")
+```
